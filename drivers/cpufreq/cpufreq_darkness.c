@@ -1,792 +1,343 @@
 /*
  *  drivers/cpufreq/cpufreq_darkness.c
  *
- *  Copyright (C)  2011 Samsung Electronics co. ltd
- *    ByungChang Cha <bc.cha@samsung.com>
- *
- *  Based on ondemand governor
  *  Copyright (C)  2001 Russell King
  *            (C)  2003 Venkatesh Pallipadi <venkatesh.pallipadi@intel.com>.
  *                      Jun Nakajima <jun.nakajima@intel.com>
+ *            (C)  2009 Alexander Clouter <alex@digriz.org.uk>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
  * published by the Free Software Foundation.
- * 
+ *
  * Created by Alucard_24@xda
  */
 
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/init.h>
-#include <linux/cpufreq.h>
 #include <linux/cpu.h>
-#include <linux/cpumask.h>
-#include <linux/jiffies.h>
-#include <linux/kernel_stat.h>
-#include <linux/mutex.h>
-#include <linux/hrtimer.h>
-#include <linux/tick.h>
-#include <linux/ktime.h>
-#include <linux/sched.h>
+#include <linux/percpu-defs.h>
 #include <linux/slab.h>
-/*
- * dbs is used in this file as a shortform for demandbased switching
- * It helps to keep variable names smaller, simpler
- */
+#include <linux/tick.h>
+#include "cpufreq_governor.h"
 
-#define MAX_HOTPLUG_RATE		(40)
-#define HOTPLUG_DOWN_INDEX		(0)
-#define HOTPLUG_UP_INDEX		(1)
+/* darkness governor macros */
+#define DEF_SAMPLING_RATE			(10000)
+#define MIN_SAMPLING_RATE			(10000)
 
-#ifndef CONFIG_CPU_EXYNOS4210
-static atomic_t hotplug_freq[4][2] = {
-	{ATOMIC_INIT(0), ATOMIC_INIT(500000)},
-	{ATOMIC_INIT(200000), ATOMIC_INIT(500000)},
-	{ATOMIC_INIT(200000), ATOMIC_INIT(500000)},
-	{ATOMIC_INIT(200000), ATOMIC_INIT(0)}
-};
-#else
-static atomic_t hotplug_freq[2][2] = {
-	{ATOMIC_INIT(0), ATOMIC_INIT(500000)},
-	{ATOMIC_INIT(200000), ATOMIC_INIT(0)}
-};
-#endif
+static DEFINE_PER_CPU(struct dk_cpu_dbs_info_s, dk_cpu_dbs_info);
 
-static void do_darkness_timer(struct work_struct *work);
-static int cpufreq_governor_darkness(struct cpufreq_policy *policy,
-				unsigned int event);
+static struct dk_ops dk_ops;
 
 #ifndef CONFIG_CPU_FREQ_DEFAULT_GOV_DARKNESS
-static
+static struct cpufreq_governor cpufreq_gov_darkness;
 #endif
-struct cpufreq_governor cpufreq_gov_darkness = {
-	.name                   = "darkness",
-	.governor               = cpufreq_governor_darkness,
-	.owner                  = THIS_MODULE,
-};
 
-struct cpufreq_darkness_cpuinfo {
-	unsigned long prev_cpu_user;
-	unsigned long prev_cpu_system;
-	unsigned long prev_cpu_others;
-	unsigned long prev_cpu_idle;
-	unsigned long prev_cpu_iowait;
-	struct delayed_work work;
-	int cpu;
-};
-/*
- * mutex that serializes governor limit change with
- * do_darkness_timer invocation. We do not want do_darkness_timer to run
- * when user is changing the governor or limits.
- */
-static DEFINE_PER_CPU(struct cpufreq_darkness_cpuinfo, od_darkness_cpuinfo);
-static DEFINE_PER_CPU(struct cpufreq_policy *, cpufreq_cpu_data);
+static void darkness_get_cpu_frequency_table(int cpu)
+{
+	struct dk_cpu_dbs_info_s *dbs_info = &per_cpu(dk_cpu_dbs_info, cpu);
 
-static unsigned int darkness_enable;	/* number of CPUs using this policy */
-/*
- * darkness_mutex protects darkness_enable in governor start/stop.
- */
-static DEFINE_MUTEX(darkness_mutex);
-static struct mutex timer_mutex;
+	dbs_info->freq_table = cpufreq_frequency_get_table(cpu);
+}
 
-/* darkness tuners */
-static struct darkness_tuners {
-	atomic_t sampling_rate;
-	atomic_t hotplug_enable;
-	atomic_t cpu_up_rate;
-	atomic_t cpu_down_rate;
-	atomic_t up_load;
-	atomic_t down_load;
-	atomic_t up_sf_step;
-	atomic_t down_sf_step;
-	atomic_t force_freqs_step;
-	atomic_t onecoresuspend;
-	atomic_t min_freq_limit;
-	atomic_t max_freq_limit;
-} darkness_tuners_ins = {
-	.sampling_rate = ATOMIC_INIT(60000),
-	.hotplug_enable = ATOMIC_INIT(0),
-	.cpu_up_rate = ATOMIC_INIT(10),
-	.cpu_down_rate = ATOMIC_INIT(5),
-	.up_load = ATOMIC_INIT(65),
-	.up_sf_step = ATOMIC_INIT(0),
-	.down_sf_step = ATOMIC_INIT(0),
-	.force_freqs_step = ATOMIC_INIT(0),
-	.onecoresuspend = ATOMIC_INIT(0),
-};
+static unsigned int adjust_cpufreq_frequency_target(struct cpufreq_policy *policy,
+					struct cpufreq_frequency_table *table,
+					unsigned int tmp_freq)
+{
+	unsigned int i = 0, l_freq = 0, h_freq = 0, target_freq = 0;
 
-static int num_rate;
+	if (tmp_freq < policy->min)
+		tmp_freq = policy->min;
+	if (tmp_freq > policy->max)
+		tmp_freq = policy->max;
 
-static int freqs_step[16][4]={
-    {1600000,1500000,1500000,1500000},
-    {1500000,1400000,1300000,1300000},
-    {1400000,1300000,1200000,1200000},
-    {1300000,1200000,1000000,1000000},
-    {1200000,1100000, 800000, 800000},
-    {1100000,1000000, 600000, 500000},
-    {1000000, 800000, 500000, 200000},
-    { 900000, 600000, 400000, 100000},
-    { 800000, 500000, 200000, 100000},
-    { 700000, 400000, 100000, 100000},
-    { 600000, 200000, 100000, 100000},
-    { 500000, 100000, 100000, 100000},
-    { 400000, 100000, 100000, 100000},
-    { 300000, 100000, 100000, 100000},
-    { 200000, 100000, 100000, 100000},
-	{ 100000, 100000, 100000, 100000}
-};
+	for (i = 0; (table[i].frequency != CPUFREQ_TABLE_END); i++) {
+		unsigned int freq = table[i].frequency;
+		if (freq != CPUFREQ_ENTRY_INVALID) {
+			if (freq < tmp_freq) {
+				h_freq = freq;
+			}
+			if (freq == tmp_freq) {
+				target_freq = freq;
+				break;
+			}
+			if (freq > tmp_freq) {
+				l_freq = freq;
+				break;
+			}
+		}
+	}
+	if (!target_freq) {
+		if (policy->cur >= h_freq
+			 && policy->cur <= l_freq)
+			target_freq = policy->cur;
+		else
+			target_freq = l_freq;
+	}
+
+	return target_freq;
+}
+
+static void dk_check_cpu(int cpu, unsigned int load)
+{
+	struct dk_cpu_dbs_info_s *dbs_info = &per_cpu(dk_cpu_dbs_info, cpu);
+	struct cpufreq_policy *policy = dbs_info->cdbs.cur_policy;
+	unsigned int next_freq = 0;
+
+	next_freq = adjust_cpufreq_frequency_target(policy, dbs_info->freq_table, 
+												 load * (policy->max / 100));
+	if (next_freq != policy->cur && next_freq > 0)
+		__cpufreq_driver_target(policy, next_freq, CPUFREQ_RELATION_L);
+
+}
+
+static void dk_dbs_timer(struct work_struct *work)
+{
+	struct dk_cpu_dbs_info_s *dbs_info = container_of(work,
+			struct dk_cpu_dbs_info_s, cdbs.work.work);
+	unsigned int cpu = dbs_info->cdbs.cur_policy->cpu;
+	struct dk_cpu_dbs_info_s *core_dbs_info = &per_cpu(dk_cpu_dbs_info,
+			cpu);
+	struct dbs_data *dbs_data = dbs_info->cdbs.cur_policy->governor_data;
+	struct dk_dbs_tuners *dk_tuners = dbs_data->tuners;
+	int delay = delay_for_sampling_rate(dk_tuners->sampling_rate);
+	bool modify_all = true;
+
+	mutex_lock(&core_dbs_info->cdbs.timer_mutex);
+	if (!need_load_eval(&core_dbs_info->cdbs, dk_tuners->sampling_rate))
+		modify_all = false;
+	else
+		dbs_check_cpu(dbs_data, cpu);
+
+	gov_queue_work(dbs_data, dbs_info->cdbs.cur_policy, delay, modify_all);
+	mutex_unlock(&core_dbs_info->cdbs.timer_mutex);
+}
 
 /************************** sysfs interface ************************/
+static struct common_dbs_data dk_dbs_cdata;
 
-/* cpufreq_darkness Governor Tunables */
-#define show_one(file_name, object)					\
-static ssize_t show_##file_name						\
-(struct kobject *kobj, struct attribute *attr, char *buf)		\
-{									\
-	return sprintf(buf, "%d\n", atomic_read(&darkness_tuners_ins.object));		\
-}
-show_one(sampling_rate, sampling_rate);
-show_one(hotplug_enable, hotplug_enable);
-show_one(cpu_up_rate, cpu_up_rate);
-show_one(cpu_down_rate, cpu_down_rate);
-show_one(up_load, up_load);
-show_one(down_load, down_load);
-show_one(up_sf_step, up_sf_step);
-show_one(down_sf_step, down_sf_step);
-show_one(force_freqs_step, force_freqs_step);
-show_one(onecoresuspend, onecoresuspend);
-show_one(min_freq_limit, min_freq_limit);
-show_one(max_freq_limit, max_freq_limit);
-
-#define show_hotplug_param(file_name, num_core, up_down)		\
-static ssize_t show_##file_name##_##num_core##_##up_down		\
-(struct kobject *kobj, struct attribute *attr, char *buf)		\
-{									\
-	return sprintf(buf, "%d\n", atomic_read(&file_name[num_core - 1][up_down]));	\
-}
-
-#define store_hotplug_param(file_name, num_core, up_down)		\
-static ssize_t store_##file_name##_##num_core##_##up_down		\
-(struct kobject *kobj, struct attribute *attr,				\
-	const char *buf, size_t count)					\
-{									\
-	unsigned int input;						\
-	int ret;							\
-	ret = sscanf(buf, "%u", &input);				\
-	if (ret != 1)							\
-		return -EINVAL;						\
-	if (input == atomic_read(&file_name[num_core - 1][up_down])) {		\
-		return count;	\
-	}	\
-	atomic_set(&file_name[num_core - 1][up_down], input);			\
-	return count;							\
-}
-
-show_hotplug_param(hotplug_freq, 1, 1);
-show_hotplug_param(hotplug_freq, 2, 0);
-#ifndef CONFIG_CPU_EXYNOS4210
-show_hotplug_param(hotplug_freq, 2, 1);
-show_hotplug_param(hotplug_freq, 3, 0);
-show_hotplug_param(hotplug_freq, 3, 1);
-show_hotplug_param(hotplug_freq, 4, 0);
-#endif
-
-store_hotplug_param(hotplug_freq, 1, 1);
-store_hotplug_param(hotplug_freq, 2, 0);
-#ifndef CONFIG_CPU_EXYNOS4210
-store_hotplug_param(hotplug_freq, 2, 1);
-store_hotplug_param(hotplug_freq, 3, 0);
-store_hotplug_param(hotplug_freq, 3, 1);
-store_hotplug_param(hotplug_freq, 4, 0);
-#endif
-
-define_one_global_rw(hotplug_freq_1_1);
-define_one_global_rw(hotplug_freq_2_0);
-#ifndef CONFIG_CPU_EXYNOS4210
-define_one_global_rw(hotplug_freq_2_1);
-define_one_global_rw(hotplug_freq_3_0);
-define_one_global_rw(hotplug_freq_3_1);
-define_one_global_rw(hotplug_freq_4_0);
-#endif
-
-/* sampling_rate */
-static ssize_t store_sampling_rate(struct kobject *a, struct attribute *b,
-				   const char *buf, size_t count)
+/**
+ * update_sampling_rate - update sampling rate effective immediately if needed.
+ * @new_rate: new sampling rate
+ *
+ * If new rate is smaller than the old, simply updating
+ * dbs_tuners_int.sampling_rate might not be appropriate. For example, if the
+ * original sampling_rate was 1 second and the requested new sampling rate is 10
+ * ms because the user needs immediate reaction from ondemand governor, but not
+ * sure if higher frequency will be required or not, then, the governor may
+ * change the sampling rate too late; up to 1 second later. Thus, if we are
+ * reducing the sampling rate, we need to make the new value effective
+ * immediately.
+ */
+static void update_sampling_rate(struct dbs_data *dbs_data,
+		unsigned int new_rate)
 {
-	int input;
-	int ret;
+	struct dk_dbs_tuners *dk_tuners = dbs_data->tuners;
+	int cpu;
 
-	ret = sscanf(buf, "%d", &input);
+	dk_tuners->sampling_rate = new_rate = max(new_rate,
+			dbs_data->min_sampling_rate);
+
+	get_online_cpus();
+	for_each_online_cpu(cpu) {
+		struct cpufreq_policy *policy;
+		struct dk_cpu_dbs_info_s *dbs_info;
+		unsigned long next_sampling, appointed_at;
+
+		policy = cpufreq_cpu_get(cpu);
+		if (!policy)
+			continue;
+		if (policy->governor != &cpufreq_gov_darkness) {
+			cpufreq_cpu_put(policy);
+			continue;
+		}
+		dbs_info = &per_cpu(dk_cpu_dbs_info, cpu);
+		cpufreq_cpu_put(policy);
+
+		mutex_lock(&dbs_info->cdbs.timer_mutex);
+
+		if (!delayed_work_pending(&dbs_info->cdbs.work)) {
+			mutex_unlock(&dbs_info->cdbs.timer_mutex);
+			continue;
+		}
+
+		next_sampling = jiffies + usecs_to_jiffies(new_rate);
+		appointed_at = dbs_info->cdbs.work.timer.expires;
+
+		if (time_before(next_sampling, appointed_at)) {
+
+			mutex_unlock(&dbs_info->cdbs.timer_mutex);
+			cancel_delayed_work_sync(&dbs_info->cdbs.work);
+			mutex_lock(&dbs_info->cdbs.timer_mutex);
+
+			gov_queue_work(dbs_data, dbs_info->cdbs.cur_policy,
+					usecs_to_jiffies(new_rate), true);
+
+		}
+		mutex_unlock(&dbs_info->cdbs.timer_mutex);
+	}
+	put_online_cpus();
+}
+
+static ssize_t store_sampling_rate(struct dbs_data *dbs_data, const char *buf,
+		size_t count)
+{
+	unsigned int input;
+	int ret = 0;
+	int mpd = strcmp(current->comm, "mpdecision");
+
+	if (mpd == 0)
+		return ret;
+
+	ret = sscanf(buf, "%u", &input);
+
 	if (ret != 1)
 		return -EINVAL;
 
-	input = max(input,10000);
-	
-	if (input == atomic_read(&darkness_tuners_ins.sampling_rate))
-		return count;
-
-	atomic_set(&darkness_tuners_ins.sampling_rate,input);
-
+	update_sampling_rate(dbs_data, input);
 	return count;
 }
 
-/* hotplug_enable */
-static ssize_t store_hotplug_enable(struct kobject *a, struct attribute *b,
-				  const char *buf, size_t count)
+static ssize_t store_ignore_nice_load(struct dbs_data *dbs_data,
+		const char *buf, size_t count)
 {
-	int input;
+	struct dk_dbs_tuners *dk_tuners = dbs_data->tuners;
+	unsigned int input, j;
 	int ret;
 
-	ret = sscanf(buf, "%d", &input);
+	ret = sscanf(buf, "%u", &input);
 	if (ret != 1)
 		return -EINVAL;
 
-	input = input > 0; 
+	if (input > 1)
+		input = 1;
 
-	if (atomic_read(&darkness_tuners_ins.hotplug_enable) == input)
+	if (input == dk_tuners->ignore_nice_load) /* nothing to do */
 		return count;
 
-	atomic_set(&darkness_tuners_ins.hotplug_enable, input);
+	dk_tuners->ignore_nice_load = input;
 
+	/* we need to re-evaluate prev_cpu_idle */
+	for_each_online_cpu(j) {
+		struct dk_cpu_dbs_info_s *dbs_info;
+		dbs_info = &per_cpu(dk_cpu_dbs_info, j);
+		dbs_info->cdbs.prev_cpu_idle = get_cpu_idle_time(j,
+					&dbs_info->cdbs.prev_cpu_wall, 0);
+		if (dk_tuners->ignore_nice_load)
+			dbs_info->cdbs.prev_cpu_nice =
+				kcpustat_cpu(j).cpustat[CPUTIME_NICE];
+	}
 	return count;
 }
 
-/* cpu_up_rate */
-static ssize_t store_cpu_up_rate(struct kobject *a, struct attribute *b,
-				 const char *buf, size_t count)
-{
-	int input;
-	int ret;
-	ret = sscanf(buf, "%d", &input);
-	if (ret != 1)
-		return -EINVAL;
+show_store_one(dk, sampling_rate);
+show_store_one(dk, ignore_nice_load);
+declare_show_sampling_rate_min(dk);
 
-	input = max(min(input,MAX_HOTPLUG_RATE),1);
+gov_sys_pol_attr_rw(sampling_rate);
+gov_sys_pol_attr_rw(ignore_nice_load);
+gov_sys_pol_attr_ro(sampling_rate_min);
 
-	if (input == atomic_read(&darkness_tuners_ins.cpu_up_rate))
-		return count;
-
-	atomic_set(&darkness_tuners_ins.cpu_up_rate,input);
-
-	return count;
-}
-
-/* cpu_down_rate */
-static ssize_t store_cpu_down_rate(struct kobject *a, struct attribute *b,
-				   const char *buf, size_t count)
-{
-	int input;
-	int ret;
-
-	ret = sscanf(buf, "%d", &input);
-	if (ret != 1)
-		return -EINVAL;
-
-	input = max(min(input,MAX_HOTPLUG_RATE),1);
-
-	if (input == atomic_read(&darkness_tuners_ins.cpu_down_rate))
-		return count;
-
-	atomic_set(&darkness_tuners_ins.cpu_down_rate,input);
-	return count;
-}
-
-/* up_load */
-static ssize_t store_up_load(struct kobject *a, struct attribute *b,
-					const char *buf, size_t count)
-{
-	int input;
-	int ret;
-
-	ret = sscanf(buf, "%d", &input);
-	if (ret != 1)
-		return -EINVAL;
-
-	input = max(min(input,101),0);
-
-	if (input == atomic_read(&darkness_tuners_ins.up_load))
-		return count;
-
-	atomic_set(&darkness_tuners_ins.up_load,input);
-
-	return count;
-}
-
-/* down_load */
-static ssize_t store_down_load(struct kobject *a, struct attribute *b,
-					const char *buf, size_t count)
-{
-	int input;
-	int ret;
-
-	ret = sscanf(buf, "%d", &input);
-	if (ret != 1)
-		return -EINVAL;
-	
-	input = max(min(input,101),0);
-
-	if (input == atomic_read(&darkness_tuners_ins.down_load))
-		return count;
-
-	atomic_set(&darkness_tuners_ins.down_load,input);
-
-	return count;
-}
-
-/* up_sf_step */
-static ssize_t store_up_sf_step(struct kobject *a, struct attribute *b,
-				   const char *buf, size_t count)
-{
-	int input;
-	int ret;
-
-	ret = sscanf(buf, "%d", &input);
-	if (ret != 1)
-		return -EINVAL;
-
-	input = max(min(input,99),0);
-
-	if (input == atomic_read(&darkness_tuners_ins.up_sf_step))
-		return count;
-
-	 atomic_set(&darkness_tuners_ins.up_sf_step,input);
-
-	return count;
-}
-
-/* down_sf_step */
-static ssize_t store_down_sf_step(struct kobject *a, struct attribute *b,
-				   const char *buf, size_t count)
-{
-	int input;
-	int ret;
-
-	ret = sscanf(buf, "%d", &input);
-	if (ret != 1)
-		return -EINVAL;
-
-	input = max(min(input,99),0);
-
-	if (input == atomic_read(&darkness_tuners_ins.down_sf_step))
-		return count;
-
-	atomic_set(&darkness_tuners_ins.down_sf_step,input);
-
-	return count;
-}
-
-/* force_freqs_step */
-static ssize_t store_force_freqs_step(struct kobject *a, struct attribute *b,
-					const char *buf, size_t count)
-{
-	int input;
-	int ret;
-
-	ret = sscanf(buf, "%d", &input);
-	if (ret != 1)
-		return -EINVAL;
-	
-	input = max(min(input,3),0);
-
-	if (input == atomic_read(&darkness_tuners_ins.force_freqs_step))
-		return count;
-
-	atomic_set(&darkness_tuners_ins.force_freqs_step,input);
-
-	return count;
-}
-
-/* onecoresuspend */
-static ssize_t store_onecoresuspend(struct kobject *a, struct attribute *b,
-				  const char *buf, size_t count)
-{
-	int input;
-	int ret;
-
-	ret = sscanf(buf, "%d", &input);
-	if (ret != 1)
-		return -EINVAL;
-
-	input = input > 0; 
-
-	if (atomic_read(&darkness_tuners_ins.onecoresuspend) == input)
-		return count;
-
-	atomic_set(&darkness_tuners_ins.onecoresuspend, input);
-
-	return count;
-}
-
-/* min_freq_limit */
-static ssize_t store_min_freq_limit(struct kobject *a, struct attribute *b,
-					const char *buf, size_t count)
-{
-	int input;
-	int ret;
-
-	ret = sscanf(buf, "%d", &input);
-	if (ret != 1)
-		return -EINVAL;
-	
-	input = max(min(input,atomic_read(&darkness_tuners_ins.max_freq_limit)),0);
-
-	if (input == atomic_read(&darkness_tuners_ins.min_freq_limit))
-		return count;
-
-	atomic_set(&darkness_tuners_ins.min_freq_limit,input);
-
-	return count;
-}
-
-/* max_freq_limit */
-static ssize_t store_max_freq_limit(struct kobject *a, struct attribute *b,
-					const char *buf, size_t count)
-{
-	int input;
-	int ret;
-
-	ret = sscanf(buf, "%d", &input);
-	if (ret != 1)
-		return -EINVAL;
-	
-	input = max(min(input,1600000),atomic_read(&darkness_tuners_ins.min_freq_limit));
-
-	if (input == atomic_read(&darkness_tuners_ins.max_freq_limit))
-		return count;
-
-	atomic_set(&darkness_tuners_ins.max_freq_limit,input);
-
-	return count;
-}
-
-define_one_global_rw(sampling_rate);
-define_one_global_rw(hotplug_enable);
-define_one_global_rw(cpu_up_rate);
-define_one_global_rw(cpu_down_rate);
-define_one_global_rw(up_load);
-define_one_global_rw(down_load);
-define_one_global_rw(up_sf_step);
-define_one_global_rw(down_sf_step);
-define_one_global_rw(force_freqs_step);
-define_one_global_rw(onecoresuspend);
-define_one_global_rw(min_freq_limit);
-define_one_global_rw(max_freq_limit);
-
-static struct attribute *darkness_attributes[] = {
-	&sampling_rate.attr,
-	&hotplug_enable.attr,
-	&hotplug_freq_1_1.attr,
-	&hotplug_freq_2_0.attr,
-#ifndef CONFIG_CPU_EXYNOS4210
-	&hotplug_freq_2_1.attr,
-	&hotplug_freq_3_0.attr,
-	&hotplug_freq_3_1.attr,
-	&hotplug_freq_4_0.attr,
-#endif
-	&cpu_up_rate.attr,
-	&cpu_down_rate.attr,
-	&up_load.attr,
-	&down_load.attr,
-	&up_sf_step.attr,
-	&down_sf_step.attr,
-	&force_freqs_step.attr,
-	&onecoresuspend.attr,
-	&min_freq_limit.attr,
-	&max_freq_limit.attr,
+static struct attribute *dbs_attributes_gov_sys[] = {
+	&sampling_rate_min_gov_sys.attr,
+	&sampling_rate_gov_sys.attr,
+	&ignore_nice_load_gov_sys.attr,
 	NULL
 };
 
-static struct attribute_group darkness_attr_group = {
-	.attrs = darkness_attributes,
+static struct attribute_group dk_attr_group_gov_sys = {
+	.attrs = dbs_attributes_gov_sys,
+	.name = "darkness",
+};
+
+static struct attribute *dbs_attributes_gov_pol[] = {
+	&sampling_rate_min_gov_pol.attr,
+	&sampling_rate_gov_pol.attr,
+	&ignore_nice_load_gov_pol.attr,
+	NULL
+};
+
+static struct attribute_group dk_attr_group_gov_pol = {
+	.attrs = dbs_attributes_gov_pol,
 	.name = "darkness",
 };
 
 /************************** sysfs end ************************/
 
-static void darkness_check_cpu(struct cpufreq_darkness_cpuinfo *this_darkness_cpuinfo)
+static int dk_init(struct dbs_data *dbs_data)
 {
-	int up_rate = atomic_read(&darkness_tuners_ins.cpu_up_rate);
-	int down_rate = atomic_read(&darkness_tuners_ins.cpu_down_rate);
-	bool onecoresuspend = atomic_read(&darkness_tuners_ins.onecoresuspend) > 0;
-	bool hotplug_enable = atomic_read(&darkness_tuners_ins.hotplug_enable) > 0;
-	int force_freq_steps = atomic_read(&darkness_tuners_ins.force_freqs_step);
-	unsigned int min_freq = atomic_read(&darkness_tuners_ins.min_freq_limit);
-	unsigned int max_freq = atomic_read(&darkness_tuners_ins.max_freq_limit);
-	int up_sf_step = atomic_read(&darkness_tuners_ins.up_sf_step);
-	int down_sf_step = atomic_read(&darkness_tuners_ins.down_sf_step);
-	unsigned int next_freq[NR_CPUS];
-	int cur_load[NR_CPUS];
-	int num_core = num_online_cpus();
-	unsigned int j,i;
+	struct dk_dbs_tuners *tuners;
 
-	for_each_cpu(j, cpu_online_mask) {
-		struct cpufreq_darkness_cpuinfo *j_darkness_cpuinfo = &per_cpu(od_darkness_cpuinfo, j);
-		struct cpufreq_policy *cpu_policy = per_cpu(cpufreq_cpu_data, j);
-		unsigned long cur_user_time, cur_system_time, cur_others_time, cur_idle_time, cur_iowait_time;
-		unsigned int busy_time, idle_time;
-		unsigned int tmp_freq;
-		unsigned long flags;
-
-		local_irq_save(flags);
-		cur_user_time = (__force unsigned long)(kcpustat_cpu(j).cpustat[CPUTIME_USER]);
-		cur_system_time = (__force unsigned long)(kcpustat_cpu(j).cpustat[CPUTIME_SYSTEM]);
-		cur_others_time = (__force unsigned long)(kcpustat_cpu(j).cpustat[CPUTIME_IRQ] + kcpustat_cpu(j).cpustat[CPUTIME_SOFTIRQ]
-																		+ kcpustat_cpu(j).cpustat[CPUTIME_STEAL] + kcpustat_cpu(j).cpustat[CPUTIME_NICE]);
-
-		cur_idle_time = (__force unsigned long)(kcpustat_cpu(j).cpustat[CPUTIME_IDLE]);
-		cur_iowait_time = (__force unsigned long)(kcpustat_cpu(j).cpustat[CPUTIME_IOWAIT]);
-		local_irq_restore(flags);
-
-		busy_time = (unsigned int)
-				((cur_user_time - j_darkness_cpuinfo->prev_cpu_user) +
-				 (cur_system_time - j_darkness_cpuinfo->prev_cpu_system) +
-				 (cur_others_time - j_darkness_cpuinfo->prev_cpu_others));
-		j_darkness_cpuinfo->prev_cpu_user = cur_user_time;
-		j_darkness_cpuinfo->prev_cpu_system = cur_system_time;
-		j_darkness_cpuinfo->prev_cpu_others = cur_others_time;
-
-		idle_time = (unsigned int)
-				((cur_idle_time - j_darkness_cpuinfo->prev_cpu_idle) + 
-				 (cur_iowait_time - j_darkness_cpuinfo->prev_cpu_iowait));
-		j_darkness_cpuinfo->prev_cpu_idle = cur_idle_time;
-		j_darkness_cpuinfo->prev_cpu_iowait = cur_iowait_time;
-
-		/*printk(KERN_ERR "TIMER CPU[%u], wall[%u], idle[%u]\n",j, busy_time + idle_time, idle_time);*/
-		if (!cpu_policy || busy_time + idle_time == 0) { /*if busy_time and idle_time are 0, evaluate cpu load next time*/
-			hotplug_enable = false;
-			continue;
-		}
-		cur_load[j] = busy_time ? (100 * busy_time) / (busy_time + idle_time) : 1;/*if busy_time is 0 cpu_load is equal to 1*/
-		/* Checking Frequency Limit */
-		if (max_freq > cpu_policy->max || max_freq < cpu_policy->min)
-			max_freq = cpu_policy->max;
-		if (min_freq < cpu_policy->min || min_freq > cpu_policy->max)
-			min_freq = cpu_policy->min;
-		/* CPUs Online Scale Frequency*/
-		tmp_freq = max(min(cur_load[j] * (max_freq / 100), max_freq), min_freq);
-		if (force_freq_steps == 0) {
-			next_freq[j] = (tmp_freq / 100000) * 100000;
-			if ((next_freq[j] > cpu_policy->cur
-				&& (tmp_freq % 100000 > up_sf_step * 1000))
-				|| (next_freq[j] < cpu_policy->cur 
-				&& (tmp_freq % 100000 > down_sf_step * 1000))) {
-					next_freq[j] += 100000;
-			}
-		} else {
-			for (i = 0; i < 16; i++) {
-				if (tmp_freq >= freqs_step[i][force_freq_steps]) {
-					next_freq[j] = freqs_step[i][force_freq_steps];
-					break;
-				}
-			}
-		}		
-		/*printk(KERN_ERR "FREQ CALC.: CPU[%u], load[%d], target freq[%u], cur freq[%u], min freq[%u], max_freq[%u]\n",j, cur_load[j], next_freq[j], cpu_policy->cur, cpu_policy->min, max_freq); */
-		if (next_freq[j] != cpu_policy->cur) {
-			__cpufreq_driver_target(cpu_policy, next_freq[j], CPUFREQ_RELATION_L);
-		}
+	tuners = kzalloc(sizeof(struct dk_dbs_tuners), GFP_KERNEL);
+	if (!tuners) {
+		pr_err("%s: kzalloc failed\n", __func__);
+		return -ENOMEM;
 	}
 
-	/* set num_rate used */
-	++num_rate;
+	dbs_data->min_sampling_rate = MIN_SAMPLING_RATE;
+	tuners->sampling_rate = DEF_SAMPLING_RATE;
+	tuners->ignore_nice_load = 0;
 
-	if (hotplug_enable) {
-		/*Check for CPU hotplug*/
-		if (!onecoresuspend && num_rate % up_rate == 0 && num_core < NR_CPUS) {
-#ifndef CONFIG_CPU_EXYNOS4210
-			if (cur_load[num_core - 1] >= atomic_read(&darkness_tuners_ins.up_load)
-				&& next_freq[num_core - 1] >= atomic_read(&hotplug_freq[num_core - 1][HOTPLUG_UP_INDEX])) {
-				/* printk(KERN_ERR "[HOTPLUG IN] %s %u>=%u\n",
-					__func__, cur_freq, up_freq); */
-				if (!cpu_online(num_core)) {
-					cpu_up(num_core);
-					num_rate = 0;
-				}
-			}
-#else
-			if (cur_load[0] >= atomic_read(&darkness_tuners_ins.up_load)
-				&& next_freq[0] >= atomic_read(&hotplug_freq[0][HOTPLUG_UP_INDEX])) {
-				/* printk(KERN_ERR "[HOTPLUG IN] %s %u>=%u\n",
-					__func__, cur_freq, up_freq); */
-				if (!cpu_online(1)) {
-					cpu_up(1);
-					num_rate = 0;
-				}
-			}
-#endif
-		} else if (num_rate % down_rate == 0 && num_core > 1) {
-#ifndef CONFIG_CPU_EXYNOS4210	
-			if (onecoresuspend 
-				|| cur_load[num_core - 1] < atomic_read(&darkness_tuners_ins.down_load) 
-				|| next_freq[num_core - 1] <= atomic_read(&hotplug_freq[num_core - 1][HOTPLUG_DOWN_INDEX])) {
-				/* printk(KERN_ERR "[HOTPLUG OUT] %s %u<=%u\n",
-					__func__, cur_freq, down_freq); */
-				if (cpu_online(num_core - 1)) {
-					cpu_down(num_core - 1);
-					num_rate = 0;
-				}
-			}
-#else
-			if (onecoresuspend 
-				|| cur_load[1] < atomic_read(&darkness_tuners_ins.down_load)
-				|| next_freq[1] <= atomic_read(&hotplug_freq[1][HOTPLUG_DOWN_INDEX])) {
-				/* printk(KERN_ERR "[HOTPLUG OUT] %s %u<=%u\n",
-					__func__, cur_freq, down_freq); */
-				if (cpu_online(1)) {
-					cpu_down(1);
-					num_rate = 0;
-				}
-			}
-#endif
-		}
-	}
-	if (num_rate == max(up_rate, down_rate)) {
-		num_rate = 0;
-	}
-}
-
-static void do_darkness_timer(struct work_struct *work)
-{
-	struct cpufreq_darkness_cpuinfo *darkness_cpuinfo =
-		container_of(work, struct cpufreq_darkness_cpuinfo, work.work);
-	int delay;
-
-	mutex_lock(&timer_mutex);
-	darkness_check_cpu(darkness_cpuinfo);
-	/* We want all CPUs to do sampling nearly on
-	 * same jiffy
-	 */
-	delay = usecs_to_jiffies(atomic_read(&darkness_tuners_ins.sampling_rate));
-	if (num_online_cpus() > 1) {
-		delay -= jiffies % delay;
-	}
-
-	mod_delayed_work_on(darkness_cpuinfo->cpu, system_wq, &darkness_cpuinfo->work, delay);
-	mutex_unlock(&timer_mutex);
-}
-
-static int cpufreq_governor_darkness(struct cpufreq_policy *policy,
-				unsigned int event)
-{
-	unsigned int cpu = policy->cpu;
-	struct cpufreq_darkness_cpuinfo *this_darkness_cpuinfo = &per_cpu(od_darkness_cpuinfo, cpu);
-	struct cpufreq_policy *cpu_policy = per_cpu(cpufreq_cpu_data, cpu);
-	unsigned int j;
-	int rc, delay;
-
-	switch (event) {
-	case CPUFREQ_GOV_START:
-		if ((!cpu_online(cpu)) || (!policy->cur))
-			return -EINVAL;
-
-		mutex_lock(&darkness_mutex);
-		num_rate = 0;
-		darkness_enable=1;
-		for_each_cpu(j, cpu_possible_mask) {
-			struct cpufreq_darkness_cpuinfo *j_darkness_cpuinfo = &per_cpu(od_darkness_cpuinfo, j);
-			unsigned long flags;
-			per_cpu(cpufreq_cpu_data, j) = policy;
-			local_irq_save(flags);
-			j_darkness_cpuinfo->prev_cpu_user = (__force unsigned long)(kcpustat_cpu(j).cpustat[CPUTIME_USER]);
-			j_darkness_cpuinfo->prev_cpu_system = (__force unsigned long)(kcpustat_cpu(j).cpustat[CPUTIME_SYSTEM]);
-			j_darkness_cpuinfo->prev_cpu_others = (__force unsigned long)(kcpustat_cpu(j).cpustat[CPUTIME_IRQ] + kcpustat_cpu(j).cpustat[CPUTIME_SOFTIRQ]
-																		+ kcpustat_cpu(j).cpustat[CPUTIME_STEAL] + kcpustat_cpu(j).cpustat[CPUTIME_NICE]);
-
-			j_darkness_cpuinfo->prev_cpu_idle = (__force unsigned long)(kcpustat_cpu(j).cpustat[CPUTIME_IDLE]);
-			j_darkness_cpuinfo->prev_cpu_iowait = (__force unsigned long)(kcpustat_cpu(j).cpustat[CPUTIME_IOWAIT]);
-			local_irq_restore(flags);
-		}
-		this_darkness_cpuinfo->cpu = cpu;
-		mutex_init(&timer_mutex);
-		INIT_DEFERRABLE_WORK(&this_darkness_cpuinfo->work, do_darkness_timer);
-		/*
-		 * Start the timerschedule work, when this governor
-		 * is used for first time
-		 */
-		if (darkness_enable == 1) {
-			rc = sysfs_create_group(cpufreq_global_kobject,
-						&darkness_attr_group);
-			if (rc) {
-				mutex_unlock(&darkness_mutex);
-				return rc;
-			}
-			atomic_set(&darkness_tuners_ins.min_freq_limit,policy->min);
-			atomic_set(&darkness_tuners_ins.max_freq_limit,policy->max);
-		}
-		delay=usecs_to_jiffies(atomic_read(&darkness_tuners_ins.sampling_rate));
-		if (num_online_cpus() > 1) {
-			delay -= jiffies % delay;
-		}
-		mutex_unlock(&darkness_mutex);
-		mod_delayed_work_on(this_darkness_cpuinfo->cpu, system_wq, &this_darkness_cpuinfo->work, delay);
-
-		break;
-
-	case CPUFREQ_GOV_STOP:
-		cancel_delayed_work_sync(&this_darkness_cpuinfo->work);
-		mutex_destroy(&timer_mutex);
-		mutex_lock(&darkness_mutex);
-		darkness_enable=0;
-		for_each_cpu(j, cpu_possible_mask) {
-			per_cpu(cpufreq_cpu_data, j) = NULL;
-		}
-
-		if (!darkness_enable) {
-			sysfs_remove_group(cpufreq_global_kobject,
-					   &darkness_attr_group);
-		}
-		mutex_unlock(&darkness_mutex);
-		
-		break;
-
-	case CPUFREQ_GOV_LIMITS:
-		if(!cpu_policy) {
-			break;
-		}
-		mutex_lock(&timer_mutex);
-		if (policy->max < cpu_policy->cur)
-			__cpufreq_driver_target(cpu_policy,
-				policy->max, CPUFREQ_RELATION_H);
-		else if (policy->min > cpu_policy->cur)
-			__cpufreq_driver_target(cpu_policy,
-				policy->min, CPUFREQ_RELATION_L);
-		mutex_unlock(&timer_mutex);
-
-		break;
-	}
+	dbs_data->tuners = tuners;
+	mutex_init(&dbs_data->mutex);
 	return 0;
 }
 
-static int __init cpufreq_gov_darkness_init(void)
+static void dk_exit(struct dbs_data *dbs_data)
 {
-	int ret;
-
-	ret = cpufreq_register_governor(&cpufreq_gov_darkness);
-	if (ret)
-		goto err_free;
-
-	return ret;
-
-err_free:
-	kfree(&darkness_tuners_ins);
-	kfree(&hotplug_freq);
-	return ret;
+	kfree(dbs_data->tuners);
 }
 
-static void __exit cpufreq_gov_darkness_exit(void)
+define_get_cpu_dbs_routines(dk_cpu_dbs_info);
+
+static struct dk_ops dk_ops = {
+	.get_cpu_frequency_table = darkness_get_cpu_frequency_table,
+};
+
+static struct common_dbs_data dk_dbs_cdata = {
+	.governor = GOV_DARKNESS,
+	.attr_group_gov_sys = &dk_attr_group_gov_sys,
+	.attr_group_gov_pol = &dk_attr_group_gov_pol,
+	.get_cpu_cdbs = get_cpu_cdbs,
+	.get_cpu_dbs_info_s = get_cpu_dbs_info_s,
+	.gov_dbs_timer = dk_dbs_timer,
+	.gov_check_cpu = dk_check_cpu,
+	.gov_ops = &dk_ops,
+	.init = dk_init,
+	.exit = dk_exit,
+};
+
+static int dk_cpufreq_governor_dbs(struct cpufreq_policy *policy,
+				   unsigned int event)
+{
+	return cpufreq_governor_dbs(policy, &dk_dbs_cdata, event);
+}
+
+#ifndef CONFIG_CPU_FREQ_DEFAULT_GOV_DARKNESS
+static
+#endif
+struct cpufreq_governor cpufreq_gov_darkness = {
+	.name			= "darkness",
+	.governor		= dk_cpufreq_governor_dbs,
+	.max_transition_latency	= TRANSITION_LATENCY_LIMIT,
+	.owner			= THIS_MODULE,
+};
+
+static int __init cpufreq_gov_dbs_init(void)
+{
+	return cpufreq_register_governor(&cpufreq_gov_darkness);
+}
+
+static void __exit cpufreq_gov_dbs_exit(void)
 {
 	cpufreq_unregister_governor(&cpufreq_gov_darkness);
-	kfree(&darkness_tuners_ins);
-	kfree(&hotplug_freq);
 }
 
 MODULE_AUTHOR("Alucard24@XDA");
-MODULE_DESCRIPTION("'cpufreq_darkness' - A dynamic cpufreq/cpuhotplug governor v.1.5");
+MODULE_DESCRIPTION("'cpufreq_darkness' - A dynamic cpufreq governor v6.0");
 MODULE_LICENSE("GPL");
 
-#ifdef CONFIG_CPU_FREQ_DEFAULT_GOV_darkness
-fs_initcall(cpufreq_gov_darkness_init);
+#ifdef CONFIG_CPU_FREQ_DEFAULT_GOV_DARKNESS
+fs_initcall(cpufreq_gov_dbs_init);
 #else
-module_init(cpufreq_gov_darkness_init);
+module_init(cpufreq_gov_dbs_init);
 #endif
-module_exit(cpufreq_gov_darkness_exit);
+module_exit(cpufreq_gov_dbs_exit);
